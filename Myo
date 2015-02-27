@@ -1,0 +1,306 @@
+
+
+#include "ext.h"							// standard Max include, always required
+#include "ext_obex.h"						// required for new style Max object
+#include "myomax.h"                         // Myo header
+/*
+#define _USE_MATH_DEFINES
+#include <cmath>
+#include <iostream>
+#include <iomanip>
+#include <stdexcept>
+#include <string>
+#include <algorithm>
+*/
+#include <myo/myo.hpp>                      // The only file that needs to be included to use the Myo C++ SDK is myo.hpp.
+#include "ext_common.h"
+#include "ext_systhread.h"
+
+#include <vector>
+using namespace std;
+
+////////////////////////// object struct
+typedef struct _myomax
+{
+    t_object					ob;			// the object itself (must be first)
+    _myomax	*myo;
+    void				*currentPose_outlet;							// our outlet
+    void				*yaw_w_outlet2;
+    void				*pitch_w_outlet3;
+    void				*roll_w_outlet4;
+} t_myomax;
+
+///////////////////////// function prototypes
+//// standard set
+void *myomax_new(t_symbol *s, long argc, t_atom *argv);
+void myomax_free(t_myomax *x);
+void myomax_assist(t_myomax *x, void *b, long m, long a, char *s);
+//// additional methods
+void myomax_int(t_myomax *x, long n);
+void myomax_float(t_myomax *x, double f);
+void myomax_bang(t_myomax *x); // incoming bang message
+
+
+t_max_err myomax_min_get(t_myomax *x, void *attr, long *ac, t_atom **av);
+t_max_err myomax_min_set(t_myomax *x, void *attr, long ac, t_atom *av);
+                             
+//////////////////////// global class pointer variable
+void *myomax_class;
+
+
+int C74_EXPORT main(void)
+{
+    // object initialization, OLD STYLE
+    // setup((t_messlist **)&myomax_class, (method)myomax_new, (method)myomax_free, (short)sizeof(t_myomax),
+    //		0L, A_GIMME, 0);
+    // addmess((method)myomax_assist,			"assist",		A_CANT, 0);
+    
+    // object initialization, NEW STYLE
+    t_class *c;
+    
+    c = class_new("myomax", (method)myomax_new, (method)myomax_free, (long)sizeof(t_myomax),
+                  0L /* leave NULL!! */, A_GIMME, 0);
+    
+    
+    /* you CAN'T call this from the patcher */
+    class_addmethod(c, (method)myomax_assist,			"assist",		A_CANT, 0);
+    
+    class_register(CLASS_BOX, c); /* CLASS_NOBOX */
+    myomax_class = c;
+    
+    post("Connected to Myo");
+    return 0;
+}
+
+void myomax_assist(t_myomax *x, void *b, long m, long a, char *s)
+{
+    if (m == ASSIST_INLET) { // inlet
+        sprintf(s, "Inlet %ld", a);
+    }
+    else {	// outlet
+        sprintf(s, "Outlet %ld", a);
+        
+    }
+}
+
+void myomax_free(t_myomax *x)
+{
+    delete (_myomax *)(x->myo);
+    
+}
+void myomax_bang(t_myomax *x);
+
+//////////////////////////////////main myo code/////////////////////////////////
+
+// Classes that inherit from myo::DeviceListener can be used to receive events from Myo devices. DeviceListener
+// provides several virtual functions for handling different kinds of events. If you do not override an event, the
+// default behavior is to do nothing.
+class DataCollector : public myo::DeviceListener {
+public:
+    DataCollector()
+    : onArm(false), isUnlocked(false), roll_w(0), pitch_w(0), yaw_w(0), currentPose()
+    {
+    }
+    
+    
+    // onUnpair() is called whenever the Myo is disconnected from Myo Connect by the user.
+    void onUnpair(myo::Myo* myo, uint64_t timestamp)
+    {
+        // We've lost a Myo.
+        // Let's clean up some leftover state.
+        roll_w = 0;
+        pitch_w = 0;
+        yaw_w = 0;
+        onArm = false;
+        isUnlocked = false;
+    }
+    
+    // onOrientationData() is called whenever the Myo device provides its current orientation, which is represented
+    // as a unit quaternion.
+    void onOrientationData(myo::Myo* myo, uint64_t timestamp, const myo::Quaternion<float>& quat)
+    {
+        using std::atan2;
+        using std::asin;
+        using std::sqrt;
+        using std::max;
+        using std::min;
+        
+        // Calculate Euler angles (roll, pitch, and yaw) from the unit quaternion.
+        float roll = atan2(2.0f * (quat.w() * quat.x() + quat.y() * quat.z()),
+                           1.0f - 2.0f * (quat.x() * quat.x() + quat.y() * quat.y()));
+        float pitch = asin(max(-1.0f, min(1.0f, 2.0f * (quat.w() * quat.y() - quat.z() * quat.x()))));
+        float yaw = atan2(2.0f * (quat.w() * quat.z() + quat.x() * quat.y()),
+                          1.0f - 2.0f * (quat.y() * quat.y() + quat.z() * quat.z()));
+        
+        // Convert the floating point angles in radians to a scale from 0 to 18.
+    
+        
+        roll_w = static_cast<int>((roll + (float)M_PI)/(M_PI * 2.0f) * 18);
+        pitch_w = static_cast<int>((pitch + (float)M_PI/2.0f)/M_PI * 18);
+        yaw_w = static_cast<int>((yaw + (float)M_PI)/(M_PI * 2.0f) * 18);
+        
+       
+    }
+    
+    // onPose() is called whenever the Myo detects that the person wearing it has changed their pose, for example,
+    // making a fist, or not making a fist anymore.
+    void onPose(myo::Myo* myo, uint64_t timestamp, myo::Pose pose)
+    {
+        currentPose = pose;
+        
+        if (pose != myo::Pose::unknown && pose != myo::Pose::rest) {
+            // Tell the Myo to stay unlocked until told otherwise. We do that here so you can hold the poses without the
+            // Myo becoming locked.
+            myo->unlock(myo::Myo::unlockHold);
+            
+            // Notify the Myo that the pose has resulted in an action, in this case changing
+            // the text on the screen. The Myo will vibrate.
+        //    myo->notifyUserAction();
+       // } else {
+            // Tell the Myo to stay unlocked only for a short period. This allows the Myo to stay unlocked while poses
+            // are being performed, but lock after inactivity.
+        //    myo->unlock(myo::Myo::unlockTimed);
+            
+            
+        }
+    }
+    
+    // onArmSync() is called whenever Myo has recognized a Sync Gesture after someone has put it on their
+    // arm. This lets Myo know which arm it's on and which way it's facing.
+    void onArmSync(myo::Myo* myo, uint64_t timestamp, myo::Arm arm, myo::XDirection xDirection)
+    {
+        onArm = true;
+        whichArm = arm;
+    }
+    
+    // onArmUnsync() is called whenever Myo has detected that it was moved from a stable position on a person's arm after
+    // it recognized the arm. Typically this happens when someone takes Myo off of their arm, but it can also happen
+    // when Myo is moved around on the arm.
+    void onArmUnsync(myo::Myo* myo, uint64_t timestamp)
+    {
+        onArm = false;
+    }
+    
+    // onUnlock() is called whenever Myo has become unlocked, and will start delivering pose events.
+    void onUnlock(myo::Myo* myo, uint64_t timestamp)
+    {
+        isUnlocked = true;
+    }
+    
+    // onLock() is called whenever Myo has become locked. No pose events will be sent until the Myo is unlocked again.
+    void onLock(myo::Myo* myo, uint64_t timestamp)
+    {
+        isUnlocked = false;
+    }
+    
+    // There are other virtual functions in DeviceListener that we could override here, like onAccelerometerData().
+    // For this example, the functions overridden above are sufficient.
+    
+    // We define this function to print the current values that were updated by the on...() functions above.
+    void print()
+    {
+        // Clear the current line
+        std::cout << '\r';
+        
+        // Print out the orientation. Orientation data is always available, even if no arm is currently recognized.
+        std::cout << '[' << std::string(roll_w, '*') << std::string(18 - roll_w, ' ') << ']'
+        << '[' << std::string(pitch_w, '*') << std::string(18 - pitch_w, ' ') << ']'
+        << '[' << std::string(yaw_w, '*') << std::string(18 - yaw_w, ' ') << ']';
+        
+        if (onArm) {
+            // Print out the lock state, the currently recognized pose, and which arm Myo is being worn on.
+            
+            // Pose::toString() provides the human-readable name of a pose. We can also output a Pose directly to an
+            // output stream (e.g. std::cout << currentPose;). In this case we want to get the pose name's length so
+            // that we can fill the rest of the field with spaces below, so we obtain it as a string using toString().
+            std::string poseString = currentPose.toString();
+            
+            std::cout << '[' << (isUnlocked ? "unlocked" : "locked  ") << ']'
+            << '[' << (whichArm == myo::armLeft ? "L" : "R") << ']'
+            << '[' << poseString << std::string(14 - poseString.size(), ' ') << ']';
+        } else {
+            // Print out a placeholder for the arm and pose when Myo doesn't currently know which arm it's on.
+            std::cout << '[' << std::string(8, ' ') << ']' << "[?]" << '[' << std::string(14, ' ') << ']';
+        }
+        
+        std::cout << std::flush;
+    }
+    
+    // These values are set by onArmSync() and onArmUnsync() above.
+    bool onArm;
+    myo::Arm whichArm;
+    
+    // This is set by onUnlocked() and onLocked() above.
+    bool isUnlocked;
+    
+    // These values are set by onOrientationData() and onPose() above.
+    int roll_w, pitch_w, yaw_w;
+    myo::Pose currentPose;
+    
+    
+};
+
+////////////////////////end of myo code/////////////////////////////
+
+
+/*
+ A_GIMME signature =
+	t_symbol	*s		objectname
+	long		argc	num additonal args
+	t_atom		*argv	array of t_atom structs
+ type = argv->a_type
+ if (type == A_LONG) ;
+ else if (type == A_FLOAT) ;
+ else if (type == A_SYM) ;
+ */
+/*
+	t_symbol {
+ char *s_name;
+ t_object *s_thing;
+	}
+ */
+
+
+
+void *myomax_new(t_symbol *s, long argc, t_atom *argv)
+{
+    t_myomax *x = NULL;
+    
+    if ((x = (t_myomax *)object_alloc((t_class *)myomax_class)))
+    {
+    object_post((t_object *)x, "myomax");
+   
+        void myomax_bang(t_myomax *x);
+        
+        //outlet_bang(x->currentPose_outlet);
+        //outlet_bang(x->yaw_w_outlet2);
+    }
+       // x->frame_id_save = 0;
+       // x->outlet = outlet_new(x, NULL);
+        
+        // Create a controller
+      //  x->myo = new myo::Myo;
+    
+    
+    x->currentPose_outlet = outlet_new(x, 0);
+   // x->yaw_w_outlet2 = outlet_float(x, 0);
+   // x->pitch_w_outlet3 = outlet_float(x, 0);
+   // x->roll_w_outlet4 = outlet_float(x, NULL);
+    
+    //x->outlet = outlet_new(x, NULL);
+       // outlet_bang(x->currentPose_outlet = outlet_new(x, NULL)); // rightmost outlet first
+       // outlet_bang(x->yaw_w_outlet2 = outlet_new(x, NULL));
+       // outlet_bang(x->pitch_w_outlet3 = outlet_new(x, NULL));
+       // outlet_bang(x->roll_w_outlet4 = outlet_new(x, NULL)); // then to the left
+   // x = (t_myomax *)object_alloc(myomax_class);
+   // x->currentPose_outlet = bangout((t_object *)x);
+  //  }
+    return (x);
+    // object instantiation, OLD STYLE
+    // if (x = (t_myomax *)newobject(myomax_class)) {
+    // 	;
+    // }
+    
+    // object instantiation, NEW STYLE
+}
+
